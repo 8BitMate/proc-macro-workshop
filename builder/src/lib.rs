@@ -3,13 +3,14 @@ extern crate proc_macro;
 use proc_macro::TokenStream;
 use proc_macro2::{Ident, Span};
 use quote::quote;
-use syn::parse::{Parse, ParseStream, Result};
+use syn::parse::Result;
 use syn::GenericArgument;
 use syn::PathArguments::AngleBracketed;
 use syn::{
-    parse_macro_input, Data, DeriveInput, Error, Fields, FieldsNamed, Lit, LitStr, Meta, Path,
-    PathSegment, Type, TypePath,
+    parse_macro_input, Data, DeriveInput, Fields, FieldsNamed, Path, PathSegment, Type, TypePath,
 };
+mod each_arg_meta;
+use crate::each_arg_meta::EachArgMeta;
 
 #[proc_macro_derive(Builder, attributes(builder))]
 pub fn derive_builder(input: TokenStream) -> TokenStream {
@@ -100,41 +101,12 @@ fn make_name_builder(name_builder: &Ident, fields_named: &FieldsNamed) -> proc_m
     }
 }
 
-struct EachArgMeta {
-    fn_name: LitStr,
-}
-
-impl Parse for EachArgMeta {
-    fn parse(input: ParseStream) -> Result<Self> {
-        let meta: Meta = input.parse()?;
-        let err = Err(Error::new_spanned(
-            &meta,
-            "expected `builder(each = \"...\")`",
-        ));
-        match meta {
-            Meta::NameValue(meta_name_value) => {
-                if let Some(path_segment) = meta_name_value.path.segments.first() {
-                    if path_segment.ident == "each" {
-                        if let Lit::Str(lit_str) = meta_name_value.lit {
-                            if lit_str.value() != "" {
-                                return Ok(EachArgMeta { fn_name: lit_str });
-                            }
-                        }
-                    }
-                }
-                err
-            }
-            _ => err,
-        }
-    }
-}
-
 fn impl_name_builder_fns(
     name_builder: &Ident,
     fields_named: &FieldsNamed,
 ) -> Result<proc_macro2::TokenStream> {
     let fields = &fields_named.named;
-    let mut builder_functions = quote!();
+    let mut builder_functions = Vec::new();
 
     for field in fields.iter() {
         let name = &field.ident;
@@ -151,51 +123,42 @@ fn impl_name_builder_fns(
                 } else {
                     &field.ty
                 };
-                builder_functions = quote! {
-                    #builder_functions
-
+                builder_functions.push(quote! {
                     pub fn #fn_name(&mut self, #_fn_name: #ty) -> &mut Self {
                         self.#name.push(#_fn_name);
                         self
                     }
-                };
+                });
             }
+        } else if let Some(inner_ty) = get_inner_optional_type(&field.ty) {
+            builder_functions.push(quote! {
+                pub fn #name(&mut self, #name: #inner_ty) -> &mut Self {
+                    self.#name = Some(#name);
+                    self
+                }
+            })
+        } else if let Some(_) = get_inner_vec_type(&field.ty) {
+            let ty = &field.ty;
+            builder_functions.push(quote! {
+                  pub fn #name(&mut self, #name: #ty) -> &mut Self {
+                    self.#name = #name;
+                    self
+                }
+            })
         } else {
-            let builder_fn = if let Some(inner_ty) = get_inner_optional_type(&field.ty) {
-                quote! {
-                    pub fn #name(&mut self, #name: #inner_ty) -> &mut Self {
-                        self.#name = Some(#name);
-                        self
-                    }
+            let ty = &field.ty;
+            builder_functions.push(quote! {
+                   pub fn #name(&mut self, #name: #ty) -> &mut Self {
+                    self.#name = Some(#name);
+                    self
                 }
-            } else if let Some(_) = get_inner_vec_type(&field.ty) {
-                let ty = &field.ty;
-                quote! {
-                      pub fn #name(&mut self, #name: #ty) -> &mut Self {
-                        self.#name = #name;
-                        self
-                    }
-                }
-            } else {
-                let ty = &field.ty;
-                quote! {
-                       pub fn #name(&mut self, #name: #ty) -> &mut Self {
-                        self.#name = Some(#name);
-                        self
-                    }
-                }
-            };
-            builder_functions = quote! {
-                #builder_functions
-
-                #builder_fn
-            }
-        }
+            })
+        };
     }
 
     Ok(quote! {
         impl #name_builder {
-            #builder_functions
+            #( #builder_functions )*
         }
     })
 }
@@ -206,22 +169,18 @@ fn impl_builder_fn(
     fields_named: &FieldsNamed,
 ) -> proc_macro2::TokenStream {
     let fields = &fields_named.named;
-    let mut default_fields = quote!();
+    let mut default_fields = Vec::new();
 
     for field in fields.iter() {
         let name = &field.ident;
-
-        default_fields = quote! {
-            #default_fields
-            #name: std::default::Default::default(),
-        };
+        default_fields.push(quote! {#name: std::default::Default::default()});
     }
 
     quote! {
         impl #name {
             pub fn builder() -> #name_builder {
                 #name_builder {
-                    #default_fields
+                    #( #default_fields ),*
                 }
             }
         }
@@ -234,27 +193,24 @@ fn impl_build_fn(
     fields_named: &FieldsNamed,
 ) -> proc_macro2::TokenStream {
     let fields = &fields_named.named;
-    let mut name_fields = quote!();
+    let mut name_fields = Vec::new();
 
     for field in fields.iter() {
         let name = &field.ident;
-        let name_string = name.as_ref().unwrap().to_string();
         if let Some(_) = get_inner_optional_type(&field.ty) {
-            name_fields = quote! {
-                #name_fields
-                #name: self.#name.take(),
-            }
+            name_fields.push(quote! {
+                #name: self.#name.take()
+            })
         } else if let Some(_) = get_inner_vec_type(&field.ty) {
-            name_fields = quote! {
-                #name_fields
-                #name: std::mem::replace(&mut self.#name, std::default::Default::default()),
-            }
+            name_fields.push(quote! {
+                #name: std::mem::replace(&mut self.#name, std::default::Default::default())
+            })
         } else {
+            let name_string = name.as_ref().unwrap().to_string();
             let error_message = format!("{} field is missing", &name_string);
-            name_fields = quote! {
-                #name_fields
-                #name: self.#name.take().ok_or_else(|| #error_message)?,
-            }
+            name_fields.push(quote! {
+                #name: self.#name.take().ok_or_else(|| #error_message)?
+            })
         }
     }
 
@@ -263,7 +219,7 @@ fn impl_build_fn(
 
             pub fn build(&mut self) -> std::result::Result<#name, std::boxed::Box<dyn std::error::Error>> {
                 Ok(#name {
-                    #name_fields
+                    #( #name_fields ),*
                 })
             }
         }
