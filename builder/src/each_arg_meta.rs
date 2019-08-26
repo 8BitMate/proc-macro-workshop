@@ -1,9 +1,8 @@
-use syn::{Error, Lit, LitStr, Meta};
 use syn::parse::{Parse, ParseStream, Result};
+use syn::{Error, Lit, LitStr, Meta};
 
-
-pub struct EachArgMeta {
-    pub fn_name: LitStr,
+pub(crate) struct EachArgMeta {
+    pub(crate) fn_name: LitStr,
 }
 
 impl Parse for EachArgMeta {
