@@ -8,21 +8,14 @@
 
 fn main() {
     use derive_debug::CustomDebug;
-    use core::marker::PhantomData;
+    use std::fmt::Debug;
 
-    #[derive(Debug)]
-    pub struct Field<T> {
-        name: &'static str,
-        bitmask: u16,
-        phantom: PhantomData<T>,
+    pub trait Trait {
+        type Value;
     }
 
-    println!(
-        "{:#?}",
-        Field {
-            name: "string",
-            bitmask: 0b00001101,
-            phantom: Default::default()
-        } as Field<()>
-    )
+    #[derive(CustomDebug)]
+    pub struct Field<T: Trait> {
+        values: Vec<T::Value>,
+    }
 }

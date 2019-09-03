@@ -5,8 +5,8 @@ use quote::{quote, quote_spanned};
 use syn::spanned::Spanned;
 use syn::{
     parse_macro_input, parse_quote, Attribute, Data, DeriveInput, Error, Field, Fields,
-    GenericArgument, Generics, Lit, Meta, MetaNameValue, Path, PathArguments, PathSegment, Result,
-    Type, TypeParam, TypePath,
+    GenericArgument, Generics, Lit, Meta, MetaList, MetaNameValue, NestedMeta, Path, PathArguments,
+    PathSegment, Result, Type, TypeParam, TypePath, WhereClause, WherePredicate,
 };
 
 #[proc_macro_derive(CustomDebug, attributes(debug))]
@@ -14,9 +14,27 @@ pub fn derive(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     let name = &input.ident;
     let name_string = name.to_string();
-    let phantom_only_types = phantom_only_types(&input.data, &input.generics);
-    let generics = set_generic_trait_bounds(&input.generics, &input.data, phantom_only_types);
-    let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
+    let bounds = parse_bounds(&input.attrs).unwrap_or_else(|err| {
+        err.to_compile_error();
+        Vec::default()
+    });
+
+    let generics;
+    let where_clause: WhereClause;
+
+    let (impl_generics, ty_generics, where_clause) = if bounds.is_empty() {
+        let phantom_only_types = phantom_only_types(&input.data, &input.generics);
+        generics = set_generic_trait_bounds(&input.generics, &input.data, phantom_only_types);
+        generics.split_for_impl()
+    } else {
+        let (impl_generics, ty_generics, _) = input.generics.split_for_impl();
+        where_clause = parse_quote! {
+        where
+        #(
+            #bounds
+        )*};
+        (impl_generics, ty_generics, Some(&where_clause))
+    };
 
     let debug_struct_fields = match input.data {
         Data::Struct(ref data) => match data.fields {
@@ -59,13 +77,16 @@ fn meta_attr_field(field: &Field, attr: &Attribute) -> Result<proc_macro2::Token
     let field_name_string = field_name.as_ref().unwrap().to_string();
     let meta = Attribute::parse_meta(attr)?;
 
-    if let Meta::NameValue(MetaNameValue { path, lit, .. }) = &meta {
+    if let Meta::NameValue(MetaNameValue {
+        path,
+        lit: Lit::Str(lit),
+        ..
+    }) = &meta
+    {
         if path.is_ident("debug") {
-            if let Lit::Str(str_lit) = lit {
-                return Ok(quote_spanned! {attr.span()=>
-                    .field(#field_name_string, &format_args!(#str_lit, &self.#field_name))
-                });
-            }
+            return Ok(quote_spanned! {attr.span()=>
+                .field(#field_name_string, &format_args!(#lit, &self.#field_name))
+            });
         }
     }
     Err(Error::new_spanned(&meta, "expected `debug = \"...\"`"))
@@ -211,5 +232,37 @@ fn associated_types<'a>(generics: &'a Generics, ty: &'a Type) -> Vec<(&'a TypePa
             None
         })
         .flatten()
+        .collect()
+}
+
+fn parse_bounds(attrs: &Vec<Attribute>) -> Result<Vec<proc_macro2::TokenStream>> {
+    attrs
+        .iter()
+        .map(|attr| {
+            let meta = attr.parse_meta()?;
+
+            if let Meta::List(MetaList { path, nested, .. }) = &meta {
+                if nested.len() == 1 && path.is_ident(&"debug") {
+                    if let NestedMeta::Meta(Meta::NameValue(MetaNameValue {
+                        path,
+                        lit: Lit::Str(lit),
+                        ..
+                    })) = nested.first().unwrap()
+                    {
+                        let lit: WherePredicate = lit.parse()?;
+
+                        if path.is_ident("bound") {
+                            return Ok(quote_spanned! {attr.span()=>
+                                #lit,
+                            });
+                        }
+                    }
+                }
+            }
+            Err(Error::new_spanned(
+                &meta,
+                "expected `debug(bound = \"...\"`)",
+            ))
+        })
         .collect()
 }
