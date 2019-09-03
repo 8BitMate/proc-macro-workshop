@@ -6,37 +6,38 @@ use syn::spanned::Spanned;
 use syn::{
     parse_macro_input, parse_quote, Attribute, Data, DeriveInput, Error, Field, Fields,
     GenericArgument, Generics, Lit, Meta, MetaList, MetaNameValue, NestedMeta, Path, PathArguments,
-    PathSegment, Result, Type, TypeParam, TypePath, WhereClause, WherePredicate,
+    PathSegment, Result, Type, TypeParam, TypePath, WherePredicate,
 };
+
+macro_rules! return_compile_error {
+    ($e:expr) => {
+        match $e {
+            Ok(val) => val,
+            Err(err) => return err.to_compile_error().into(),
+        }
+    };
+}
 
 #[proc_macro_derive(CustomDebug, attributes(debug))]
 pub fn derive(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     let name = &input.ident;
     let name_string = name.to_string();
-    let bounds = parse_bounds(&input.attrs).unwrap_or_else(|err| {
-        err.to_compile_error();
-        Vec::default()
-    });
+    let where_clause = return_compile_error!(parse_bounds(&input.attrs));
 
     let generics;
-    let where_clause: WhereClause;
 
-    let (impl_generics, ty_generics, where_clause) = if bounds.is_empty() {
+    let (impl_generics, ty_generics, where_clause) = if let Some(where_clause) = where_clause {
+        let (impl_generics, ty_generics, _) = input.generics.split_for_impl();
+        (impl_generics, ty_generics, where_clause)
+    } else {
         let phantom_only_types = phantom_only_types(&input.data, &input.generics);
         generics = set_generic_trait_bounds(&input.generics, &input.data, phantom_only_types);
-        generics.split_for_impl()
-    } else {
-        let (impl_generics, ty_generics, _) = input.generics.split_for_impl();
-        where_clause = parse_quote! {
-        where
-        #(
-            #bounds
-        )*};
-        (impl_generics, ty_generics, Some(&where_clause))
+        let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
+        (impl_generics, ty_generics, quote!(#where_clause))
     };
 
-    let debug_struct_fields = match input.data {
+    let debug_struct_fields: Result<Vec<_>> = match input.data {
         Data::Struct(ref data) => match data.fields {
             Fields::Named(ref fields) => fields.named.iter().map(|field| {
                 let field_name = &field.ident;
@@ -44,21 +45,24 @@ pub fn derive(input: TokenStream) -> TokenStream {
 
                 if field.attrs.len() == 1 {
                     let attr = field.attrs.iter().next().unwrap();
-                    meta_attr_field(&field, &attr).unwrap_or_else(|err| err.to_compile_error())
+                    meta_attr_field(&field, &attr)
                 } else {
-                    quote_spanned! {field.span()=>
+                    Ok(quote_spanned! {field.span()=>
                         .field(#field_name_string, &self.#field_name)
-                    }
+                    })
                 }
             }),
             Fields::Unnamed(_) | Fields::Unit => unimplemented!(),
         },
 
         Data::Enum(_) | Data::Union(_) => unimplemented!(),
-    };
+    }
+    .collect();
+
+    let debug_struct_fields = return_compile_error!(debug_struct_fields);
 
     let expanded = quote! {
-        impl #impl_generics ::std::fmt::Debug for #name #ty_generics #where_clause{
+        impl #impl_generics ::std::fmt::Debug for #name #ty_generics #where_clause {
             fn fmt(&self, fmt: &mut std::fmt::Formatter) -> std::fmt::Result {
                 fmt.debug_struct(#name_string)
                    #(
@@ -235,8 +239,8 @@ fn associated_types<'a>(generics: &'a Generics, ty: &'a Type) -> Vec<(&'a TypePa
         .collect()
 }
 
-fn parse_bounds(attrs: &Vec<Attribute>) -> Result<Vec<proc_macro2::TokenStream>> {
-    attrs
+fn parse_bounds(attrs: &Vec<Attribute>) -> Result<Option<proc_macro2::TokenStream>> {
+    let where_predicates: Result<Vec<proc_macro2::TokenStream>> = attrs
         .iter()
         .map(|attr| {
             let meta = attr.parse_meta()?;
@@ -264,5 +268,18 @@ fn parse_bounds(attrs: &Vec<Attribute>) -> Result<Vec<proc_macro2::TokenStream>>
                 "expected `debug(bound = \"...\"`)",
             ))
         })
-        .collect()
+        .collect();
+
+    let where_predicates = where_predicates?;
+
+    if where_predicates.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(quote! {
+            where
+            #(
+                #where_predicates
+            )*
+        }))
+    }
 }
